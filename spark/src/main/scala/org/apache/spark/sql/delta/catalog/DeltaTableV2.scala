@@ -101,7 +101,7 @@ class DeltaTableV2 private(
     val tableIdentifier: Option[String],
     val timeTravelOpt: Option[DeltaTimeTravelSpec],
     val options: Map[String, String],
-    val pathInfo: PathInfo,
+    val pathInfo: PathInfo
 )
   extends Table
   with SupportsWrite
@@ -410,7 +410,7 @@ class DeltaTableV2 private(
     catalogTable: Option[CatalogTable] = this.catalogTable,
     tableIdentifier: Option[String] = this.tableIdentifier,
     timeTravelOpt: Option[DeltaTimeTravelSpec] = this.timeTravelOpt,
-    options: Map[String, String] = this.options,
+    options: Map[String, String] = this.options
   ): DeltaTableV2 = {
     // Must go through `apply` so that `path` is correctly parsed.
     DeltaTableV2(
@@ -419,7 +419,7 @@ class DeltaTableV2 private(
       catalogTable,
       tableIdentifier,
       options,
-      timeTravelOpt,
+      timeTravelOpt
     )
   }
 
@@ -452,7 +452,7 @@ object DeltaTableV2 {
       catalogTable: Option[CatalogTable] = None,
       tableIdentifier: Option[String] = None,
       options: Map[String, String] = Map.empty[String, String],
-      timeTravelOpt: Option[DeltaTimeTravelSpec] = None,
+      timeTravelOpt: Option[DeltaTimeTravelSpec] = None
   ): DeltaTableV2 = {
     val deltaTable = new DeltaTableV2(
       spark,
@@ -467,7 +467,7 @@ object DeltaTableV2 {
         path = path,
         catalogTableOpt = catalogTable,
         options = options
-      ),
+      )
     )
     if (spark == null || spark.sessionState == null ||
         !spark.sessionState.conf.getConf(ENABLE_TABLE_REDIRECT_FEATURE)) {
@@ -499,8 +499,7 @@ object DeltaTableV2 {
             path = newPath,
             catalogTableOpt = catalogTable,
             options = options
-          ),
-          forceLazilyEvalDeltaLog
+          )
         )
       }
     }
@@ -551,8 +550,8 @@ object DeltaTableV2 {
       tableIdentifier = None,
       timeTravelOpt = None,
       options = Map.empty,
-      pathInfo = PathInfo(spark, path, catalogTableOpt = None, options = Map.empty),
-      forceLazilyEvalDeltaLog = false) {
+      pathInfo = PathInfo(spark, path, catalogTableOpt = None, options = Map.empty)
+    ) {
       override lazy val deltaLog: DeltaLog = DeltaLog.forTable(spark, path, clock)
     }
   }
