@@ -45,6 +45,7 @@ import io.delta.kernel.internal.util.{Clock, JsonUtils}
 import io.delta.kernel.internal.util.SchemaUtils.casePreservingPartitionColNames
 import io.delta.kernel.internal.util.Utils.toCloseableIterator
 import io.delta.kernel.shaded.com.fasterxml.jackson.databind.node.ObjectNode
+import io.delta.kernel.test.MockEngineUtils
 import io.delta.kernel.transaction.DataLayoutSpec
 import io.delta.kernel.types._
 import io.delta.kernel.types.ByteType.BYTE
@@ -2029,6 +2030,62 @@ abstract class AbstractDeltaTableWritesSuite extends AnyFunSuite with AbstractWr
         Integer.valueOf(RemoveFile.FULL_SCHEMA.indexOf("size")) -> Long.box(100L)).asJava)
 
     SingleAction.createRemoveFileSingleAction(removeFileRow)
+  }
+
+  test("validateForCommit checks data actions without creating a Delta log") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val tableProps = Map(TableConfig.CHANGE_DATA_FEED_ENABLED.getKey -> "true")
+      val txn = getCreateTxn(engine, tablePath, testSchema, tableProperties = tableProps)
+      val path = "file1.parquet"
+      val actions = Seq(
+        createAddFileRow(path, dataChange = true),
+        createRemoveFileRow(path, dataChange = true))
+      val actionsIterable = inMemoryIterable(toCloseableIterator(actions.asJava.iterator()))
+
+      intercept[KernelException] {
+        txn.validateForCommit(engine, actionsIterable)
+      }
+
+      assert(!new File(tablePath, "_delta_log").exists())
+    }
+  }
+
+  test("validateForCommit leaves the transaction available for a real commit") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      val tableProps = Map(TableConfig.CHANGE_DATA_FEED_ENABLED.getKey -> "true")
+      val txn = getCreateTxn(engine, tablePath, testSchema, tableProperties = tableProps)
+      val actions = Seq(createAddFileRow(dataChange = true))
+      val actionsIterable = inMemoryIterable(toCloseableIterator(actions.asJava.iterator()))
+
+      txn.validateForCommit(engine, actionsIterable)
+      assert(!new File(tablePath, "_delta_log").exists())
+
+      val result = commitTransaction(txn, engine, actionsIterable)
+      assert(result.getVersion === 0)
+      assert(new File(tablePath, "_delta_log").exists())
+    }
+  }
+
+  test("validateForCommit on an update does not read existing active files") {
+    withTempDirAndEngine { (tablePath, engine) =>
+      appendData(
+        engine,
+        tablePath,
+        isNewTable = true,
+        schema = testSchema,
+        data = seqOfUnpartitionedDataBatch1)
+      val snapshot = Table.forPath(engine, tablePath).getLatestSnapshot(engine)
+      val txn = snapshot
+        .buildUpdateTableTransaction(testEngineInfo, WRITE)
+        .build(engine)
+      val actions = Seq(createAddFileRow("staged.parquet"))
+      val actionsIterable = inMemoryIterable(toCloseableIterator(actions.asJava.iterator()))
+
+      // Every Engine method throws. Validation therefore fails if it scans the snapshot or performs
+      // any other read after the update transaction has been built.
+      val noReadEngine = new MockEngineUtils {}.mockEngine()
+      txn.validateForCommit(noReadEngine, actionsIterable)
+    }
   }
 
   // Test cases: (description, actions, shouldSucceed)

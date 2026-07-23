@@ -116,6 +116,25 @@ public interface Transaction {
       throws ConcurrentWriteException;
 
   /**
+   * Validates the provided data actions against this transaction without committing them.
+   *
+   * <p>This performs the action-dependent preparation and validation that normally occurs before
+   * the transaction's {@link Committer} is invoked, including row-tracking preparation, domain
+   * metadata validation, append-only checks, and supported Change Data Feed action combinations. It
+   * does not invoke the committer, create Delta log directories, resolve concurrent writes, or run
+   * post-commit processing.
+   *
+   * <p>The actions may be accessed multiple times and must therefore be provided as a restartable
+   * {@link CloseableIterable}, with the same requirements as {@link #commit(Engine,
+   * CloseableIterable)}.
+   *
+   * @param engine {@link Engine} instance used for any reads needed by validation.
+   * @param dataActions iterable of AddFile and RemoveFile actions to validate.
+   */
+  @Experimental
+  void validateForCommit(Engine engine, CloseableIterable<Row> dataActions);
+
+  /**
    * Adds custom properties that will be passed through to the committer. These properties allow
    * connectors to inject catalog-specific metadata without Kernel inspection. Repeated calls to
    * this method will overwrite any previously set properties.

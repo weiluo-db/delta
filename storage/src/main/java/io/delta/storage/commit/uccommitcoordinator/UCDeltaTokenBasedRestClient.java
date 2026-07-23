@@ -150,6 +150,14 @@ public class UCDeltaTokenBasedRestClient implements UCDeltaClient {
       }
     });
 
+    // HACK: local-debug only. If UC_TRAFFIC_ID is set, attach it as the
+    // x-databricks-traffic-id header on every outbound request so the request
+    // gets routed to the matching liteswap traffic env.
+    String trafficId = System.getenv("UC_TRAFFIC_ID");
+    if (trafficId != null && !trafficId.isEmpty()) {
+      builder.addRequestInterceptor(req -> req.header("x-databricks-traffic-id", trafficId));
+    }
+
     this.apiClient = builder.build();
     this.deltaTablesApi = new DeltaTablesApi(this.apiClient);
     this.metastoresApi = new MetastoresApi(this.apiClient);
