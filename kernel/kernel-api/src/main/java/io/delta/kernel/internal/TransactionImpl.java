@@ -271,15 +271,7 @@ public class TransactionImpl implements Transaction {
   public TransactionCommitResult commit(Engine engine, CloseableIterable<Row> dataActions)
       throws ConcurrentWriteException {
     checkState(!closed, "Transaction is already attempted to commit. Create a new transaction.");
-    // For a new table or when fileSizeHistogram is available in the CRC of the readSnapshotOpt
-    // we update it in the commit. When it is not available we do nothing.
-    TransactionMetrics txnMetrics =
-        readSnapshotOpt
-            .map(
-                snapshot ->
-                    TransactionMetrics.withExistingTableFileSizeHistogram(
-                        snapshot.getCurrentCrcInfo().flatMap(CRCInfo::getFileSizeHistogram)))
-            .orElse(TransactionMetrics.forNewTable());
+    TransactionMetrics txnMetrics = createTransactionMetrics();
     try {
       final Tuple2<ParsedDeltaData, Optional<Long>> committedDeltaAndIct =
           txnMetrics.totalCommitTimer.time(() -> commitWithRetry(engine, dataActions, txnMetrics));
@@ -295,6 +287,46 @@ public class TransactionImpl implements Transaction {
           Optional.of(e) /* exception */);
       throw e;
     }
+  }
+
+  @Override
+  public void validateForCommit(Engine engine, CloseableIterable<Row> dataActions) {
+    requireNonNull(engine, "engine is null");
+    requireNonNull(dataActions, "dataActions is null");
+    checkState(!closed, "Transaction is already attempted to commit. Create a new transaction.");
+
+    final long commitAsVersion = getReadTableVersion() + 1;
+    final TransactionMetrics txnMetrics = createTransactionMetrics();
+    final CloseableIterable<Row> preparedDataActions =
+        prepareDataActionsForCommit(commitAsVersion, dataActions);
+
+    final List<DomainMetadata> resolvedDomainMetadatas =
+        domainMetadataState.getComputedDomainMetadatasToCommit();
+    DomainMetadataUtils.validateDomainMetadatas(resolvedDomainMetadatas, protocol);
+
+    final CloseableIterator<Row> userDataIter = preparedDataActions.iterator();
+    final CloseableIterator<Row> completeFileActionIter =
+        isReplaceTable() ? getRemoveActionsForReplace(engine).combine(userDataIter) : userDataIter;
+
+    try (CloseableIterator<Row> validatedActions =
+        validateAndTrackFileActions(completeFileActionIter, txnMetrics)) {
+      while (validatedActions.hasNext()) {
+        validatedActions.next();
+      }
+    } catch (IOException ioe) {
+      throw new UncheckedIOException("Failed to close validated data actions", ioe);
+    }
+  }
+
+  private TransactionMetrics createTransactionMetrics() {
+    // For a new table or when fileSizeHistogram is available in the CRC of the readSnapshotOpt
+    // we update it in the commit. When it is not available we do nothing.
+    return readSnapshotOpt
+        .map(
+            snapshot ->
+                TransactionMetrics.withExistingTableFileSizeHistogram(
+                    snapshot.getCurrentCrcInfo().flatMap(CRCInfo::getFileSizeHistogram)))
+        .orElse(TransactionMetrics.forNewTable());
   }
 
   //////////////////
@@ -402,31 +434,7 @@ public class TransactionImpl implements Transaction {
       CommitInfo attemptCommitInfo = generateCommitAction(engine);
       updateMetadataWithICTIfRequired(
           engine, attemptCommitInfo.getInCommitTimestamp(), getReadTableVersion());
-      List<DomainMetadata> resolvedDomainMetadatas =
-          domainMetadataState.getComputedDomainMetadatasToCommit();
-
-      // If row tracking is supported, assign base row IDs and default row commit versions to any
-      // AddFile actions that do not yet have them. If the row ID high watermark changes, emit a
-      // DomainMetadata action to update it.
-      if (TableFeatures.isRowTrackingSupported(protocol)) {
-        List<DomainMetadata> updatedDomainMetadata =
-            RowTracking.updateRowIdHighWatermarkIfNeeded(
-                readSnapshotOpt,
-                protocol,
-                Optional.empty() /* winningTxnRowIdHighWatermark */,
-                dataActions,
-                resolvedDomainMetadatas,
-                providedRowIdHighWatermark);
-        domainMetadataState.setComputedDomainMetadatas(updatedDomainMetadata);
-        dataActions =
-            RowTracking.assignBaseRowIdAndDefaultRowCommitVersion(
-                readSnapshotOpt,
-                protocol,
-                Optional.empty() /* winningTxnRowIdHighWatermark */,
-                Optional.empty() /* prevCommitVersion */,
-                commitAsVersion,
-                dataActions);
-      }
+      dataActions = prepareDataActionsForCommit(commitAsVersion, dataActions);
 
       int attempt = 1;
       boolean seenRetryableNonConflictException = false;
@@ -504,6 +512,36 @@ public class TransactionImpl implements Transaction {
     }
   }
 
+  private CloseableIterable<Row> prepareDataActionsForCommit(
+      long commitAsVersion, CloseableIterable<Row> dataActions) {
+    List<DomainMetadata> resolvedDomainMetadatas =
+        domainMetadataState.getComputedDomainMetadatasToCommit();
+
+    // If row tracking is supported, assign base row IDs and default row commit versions to any
+    // AddFile actions that do not yet have them. If the row ID high watermark changes, emit a
+    // DomainMetadata action to update it.
+    if (TableFeatures.isRowTrackingSupported(protocol)) {
+      List<DomainMetadata> updatedDomainMetadata =
+          RowTracking.updateRowIdHighWatermarkIfNeeded(
+              readSnapshotOpt,
+              protocol,
+              Optional.empty() /* winningTxnRowIdHighWatermark */,
+              dataActions,
+              resolvedDomainMetadatas,
+              providedRowIdHighWatermark);
+      domainMetadataState.setComputedDomainMetadatas(updatedDomainMetadata);
+      return RowTracking.assignBaseRowIdAndDefaultRowCommitVersion(
+          readSnapshotOpt,
+          protocol,
+          Optional.empty() /* winningTxnRowIdHighWatermark */,
+          Optional.empty() /* prevCommitVersion */,
+          commitAsVersion,
+          dataActions);
+    }
+
+    return dataActions;
+  }
+
   /** Returns (commitDeltaData, inCommitTimestamp). */
   private Tuple2<ParsedDeltaData, Optional<Long>> doCommit(
       Engine engine,
@@ -542,46 +580,12 @@ public class TransactionImpl implements Transaction {
         completeFileActionIter = userStageDataIter;
       }
 
-      boolean isAppendOnlyTable = APPEND_ONLY_ENABLED.fromMetadata(metadata);
-      boolean isCdfEnabled = TableConfig.CHANGE_DATA_FEED_ENABLED.fromMetadata(metadata);
-
-      // Track CDF validation state: whether we've seen adds and removes
-      // with enableChangeDataFeed=true
-      // This is wrapped in an AtomicBoolean to allow modification from within the lambda
-      final AtomicBoolean hasAddWithDataChange = new AtomicBoolean(false);
-      final AtomicBoolean hasRemoveWithDataChange = new AtomicBoolean(false);
-
       // Create a new CloseableIterator that will return the metadata actions followed by the
       // data actions.
       CloseableIterator<Row> dataAndMetadataActions =
-          toCloseableIterator(metadataActions.iterator())
-              .combine(completeFileActionIter)
-              .map(
-                  action -> {
-                    incrementMetricsForFileActionRow(transactionMetrics, action);
-                    if (!action.isNullAt(REMOVE_FILE_ORDINAL)) {
-                      RemoveFile removeFile = new RemoveFile(action.getStruct(REMOVE_FILE_ORDINAL));
-                      if (isAppendOnlyTable && removeFile.getDataChange()) {
-                        throw DeltaErrors.cannotModifyAppendOnlyTable(dataPath.toString());
-                      }
-                      if (isCdfEnabled && removeFile.getDataChange()) {
-                        hasRemoveWithDataChange.set(true);
-                        if (hasAddWithDataChange.get()) {
-                          throw DeltaErrors.cdfMixedAddRemoveNotSupported(dataPath.toString());
-                        }
-                      }
-                    }
-                    if (!action.isNullAt(ADD_FILE_ORDINAL)) {
-                      AddFile addFile = new AddFile(action.getStruct(ADD_FILE_ORDINAL));
-                      if (isCdfEnabled && addFile.getDataChange()) {
-                        hasAddWithDataChange.set(true);
-                        if (hasRemoveWithDataChange.get()) {
-                          throw DeltaErrors.cdfMixedAddRemoveNotSupported(dataPath.toString());
-                        }
-                      }
-                    }
-                    return action;
-                  });
+          validateAndTrackFileActions(
+              toCloseableIterator(metadataActions.iterator()).combine(completeFileActionIter),
+              transactionMetrics);
 
       final CommitMetadata commitMetadata =
           new CommitMetadata(
@@ -612,6 +616,44 @@ public class TransactionImpl implements Transaction {
   ////////////////////////////////
   // Commit Execution (Helpers) //
   ////////////////////////////////
+
+  private CloseableIterator<Row> validateAndTrackFileActions(
+      CloseableIterator<Row> actions, TransactionMetrics transactionMetrics) {
+    final boolean isAppendOnlyTable = APPEND_ONLY_ENABLED.fromMetadata(metadata);
+    final boolean isCdfEnabled = TableConfig.CHANGE_DATA_FEED_ENABLED.fromMetadata(metadata);
+
+    // Track whether this action stream contains data-changing adds and removes. Kernel does not yet
+    // support committing both when Change Data Feed is enabled.
+    final AtomicBoolean hasAddWithDataChange = new AtomicBoolean(false);
+    final AtomicBoolean hasRemoveWithDataChange = new AtomicBoolean(false);
+
+    return actions.map(
+        action -> {
+          incrementMetricsForFileActionRow(transactionMetrics, action);
+          if (!action.isNullAt(REMOVE_FILE_ORDINAL)) {
+            RemoveFile removeFile = new RemoveFile(action.getStruct(REMOVE_FILE_ORDINAL));
+            if (isAppendOnlyTable && removeFile.getDataChange()) {
+              throw DeltaErrors.cannotModifyAppendOnlyTable(dataPath.toString());
+            }
+            if (isCdfEnabled && removeFile.getDataChange()) {
+              hasRemoveWithDataChange.set(true);
+              if (hasAddWithDataChange.get()) {
+                throw DeltaErrors.cdfMixedAddRemoveNotSupported(dataPath.toString());
+              }
+            }
+          }
+          if (!action.isNullAt(ADD_FILE_ORDINAL)) {
+            AddFile addFile = new AddFile(action.getStruct(ADD_FILE_ORDINAL));
+            if (isCdfEnabled && addFile.getDataChange()) {
+              hasAddWithDataChange.set(true);
+              if (hasRemoveWithDataChange.get()) {
+                throw DeltaErrors.cdfMixedAddRemoveNotSupported(dataPath.toString());
+              }
+            }
+          }
+          return action;
+        });
+  }
 
   private CommitInfo generateCommitAction(Engine engine) {
     long commitAttemptStartTime = clock.getTimeMillis();
